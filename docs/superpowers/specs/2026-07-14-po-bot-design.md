@@ -7,7 +7,7 @@
 
 PO Bot helps an FRC (FIRST Robotics Competition) team's purchasing mentor manage part requests and order tracking with minimal manual effort. Students request parts via Slack; the mentor places orders through normal vendor channels (unchanged); the app auto-detects order confirmations and tracking numbers from a Gmail label and surfaces live shipment status on a public dashboard, so students can see when their parts will arrive without asking.
 
-**Non-goals:** PO Bot does not place orders itself, does not handle payment/budget approval workflows, and does not manage inventory once items are delivered.
+**Non-goals:** PO Bot does not place orders itself and does not handle payment/budget approval workflows. It does track on-hand inventory once items are delivered (see Inventory Management), but does not track checkout/consumption of parts onto specific robots — that's reconciled via manual cycle counts.
 
 ## Architecture & Tech Stack
 
@@ -42,6 +42,8 @@ erDiagram
     REQUESTS |o--o| ORDER_LINE_ITEMS : "matched by"
     SHIPMENTS |o--o{ WEBHOOK_LOGS : "updated by"
     ORDERS |o--o{ WEBHOOK_LOGS : "updated by"
+    INVENTORY_ITEMS ||--o{ INVENTORY_HISTORY : "has history"
+    REQUESTS |o--o| INVENTORY_HISTORY : "triggers delivery add"
 
     VENDORS {
         id INTEGER PK
@@ -127,15 +129,39 @@ erDiagram
         id INTEGER PK
         google_email TEXT
     }
+
+    INVENTORY_ITEMS {
+        id INTEGER PK
+        part_number TEXT "nullable, unique when present"
+        item_name TEXT "normalized; matching key when no part number"
+        quantity_on_hand INTEGER
+        created_at TEXT
+        updated_at TEXT
+    }
+
+    INVENTORY_HISTORY {
+        id INTEGER PK
+        inventory_item_id INTEGER FK
+        change_type TEXT "delivery / cycle_count_set / cycle_count_delta"
+        quantity_before INTEGER
+        quantity_after INTEGER
+        delta INTEGER
+        source_request_id INTEGER FK "nullable, set for delivery-triggered rows"
+        admin_google_email TEXT "nullable, set for manual adjustments"
+        note TEXT "nullable"
+        created_at TEXT
+    }
 ```
 
 **Notes:**
 - A `request`'s public board stage is derived from its own lifecycle plus its matched order/shipments: Requested (no match yet) → Ordered (matched to an `order_line_item`, no shipment yet) → Shipped (any shipment on that order is in transit) → Delivered (**all** shipments on the order are delivered — see the Tracking section for why this is per-order, not per-line-item). "Needs Review" is a separate, admin-only concept — it describes `order_line_items` with `matched_request_id IS NULL`, not a state a `request` itself enters; an unmatched request simply stays Requested until it's matched.
-- `requests.ordered_at` / `delivered_at` are denormalized timestamps, stamped by the matching logic and the EasyPost webhook handler respectively, so stage-duration stats (requested→delivered, ordered→delivered) are a simple subtraction rather than a multi-table join at query time.
+- `requests.ordered_at` / `delivered_at` are denormalized timestamps, stamped by the matching logic and the EasyPost webhook handler respectively, so stage-duration stats — requested→ordered (how long the mentor takes to place the order) and ordered→delivered (a vendor shipping-speed metric) — are a simple subtraction rather than a multi-table join at query time.
 - `vendors.part_number_regex` validates a student-supplied part number at Slack intake time. A part number that doesn't match any known vendor pattern isn't accepted on its own — the bot asks for a link instead.
 - `settings` is a flat key-value table for runtime-tunable knobs — starting with the Slack-parse confidence threshold — so they can change from the admin dashboard without a redeploy.
 - `webhook_logs` has one nullable, real foreign key per referenceable entity (`related_shipment_id`, `related_order_id`) rather than a polymorphic reference, so referential integrity is enforced by D1. Adding a third source later (e.g. `related_request_id` for a future Gmail push event) is a one-column migration.
 - `order_line_items.added_manually` and `shipments.added_manually` distinguish admin-entered records from auto-parsed ones, useful for the stats/observability views.
+- `inventory_items` is keyed by `part_number` when the delivered request had a validated one; otherwise it matches/creates by normalized `item_name`, so identical parts ordered across multiple requests aggregate into one on-hand count rather than a separate row per delivery.
+- `inventory_history` is an append-only ledger — every change to `quantity_on_hand`, whether an automatic delivery add or a manual cycle-count adjustment, gets a row recording `quantity_before`/`quantity_after`/`delta`, so on-hand counts are always reconstructable and auditable.
 
 ## Slack Request Flow
 
@@ -168,6 +194,16 @@ erDiagram
 2. EasyPost calls `/webhooks/easypost` on every status change. The handler verifies the webhook signature (rejecting unsigned/invalid requests before processing), logs the call to `webhook_logs` (payload in/out, HTTP status, processing outcome, duration), then updates the matching `shipments` row (`status`, `last_event_at`, `estimated_delivery`).
 3. **Known simplification**: shipments link to `orders`, not individual `order_line_items` — generally there's no way to know which box a specific part shipped in. A request only reaches the Delivered stage (and gets `delivered_at` stamped) once **every** shipment on its order is delivered, even if that student's specific item physically arrived earlier in a different box. This is a deliberate v1 trade-off, not an oversight — revisit only if it causes real confusion in practice.
 
+## Inventory Management
+
+1. **Auto-add on delivery**: whenever a `request` reaches Delivered (its `delivered_at` gets stamped, per the Tracking flow), the system finds or creates an `inventory_items` row — by `part_number` if the request had a validated one, otherwise by normalized `item_name` — and increments `quantity_on_hand` by the request's `quantity`. An `inventory_history` row is written alongside it (`change_type = delivery`, `source_request_id` set, `delta = +quantity`, `quantity_before`/`quantity_after` recorded).
+2. **Manual cycle count adjustment** (admin dashboard): pick an existing inventory item and either:
+   - **Set total to X** — enter the newly counted on-hand quantity; the system computes the delta itself (`change_type = cycle_count_set`).
+   - **Adjust by ±X** — enter a known delta directly, e.g. "-3 used on the robot" (`change_type = cycle_count_delta`).
+   Either path logs an `inventory_history` row with `admin_google_email` and an optional `note` (e.g. "recount after competition", "3 broken during build").
+3. **Manually create an inventory item** — for seeding on-hand stock that predates PO Bot or was never a tracked delivery (e.g. existing parts-room stock). Creation is itself the first `inventory_history` row (`change_type = cycle_count_set`, `quantity_before = 0`).
+4. Inventory is admin-only in v1 (consistent with Settings and Webhook Logs). A public "what's in stock" view is a plausible fast-follow but isn't required to ship this.
+
 ## Dashboard
 
 - **Public `/`** — read-only board (Requested / Ordered / Shipped / Delivered columns). Cards show item name, quantity, requester, part number/link, and for Shipped cards a compact tracking summary (carrier, latest status, estimated delivery).
@@ -176,7 +212,8 @@ erDiagram
   - Manually add order / manually add shipment
   - Settings page — confidence threshold, vendor list + regexes
   - Webhook log viewer — filter by source/status/date, inspect payloads
-  - Stats view — requested→delivered and ordered→delivered averages/medians, derived from `requests` timestamps
+  - Stats view — requested→ordered (mentor turnaround time) and ordered→delivered (vendor shipping speed) averages/medians, derived from `requests` timestamps
+  - Inventory — on-hand quantities per item, manual cycle-count adjustment (set-total or delta), manually add a new item, and a per-item history view (chronological deliveries + adjustments)
 
 ## Error Handling & Edge Cases
 
@@ -189,7 +226,7 @@ erDiagram
 
 ## Testing Strategy
 
-- Vitest unit tests for deterministic logic: part-number regex validation, confidence thresholding, matching logic, multi-shipment aggregation.
+- Vitest unit tests for deterministic logic: part-number regex validation, confidence thresholding, matching logic, multi-shipment aggregation, inventory quantity math (delivery add, set-total, delta adjustment).
 - Miniflare/local D1 integration tests for the matching and webhook-handling flows end-to-end.
 - LLM calls are non-deterministic — tests use recorded/stubbed Workers AI responses (fixtures), not live model calls in CI.
 - Mocked EasyPost webhook payloads to test the handler and `webhook_logs` recording.
